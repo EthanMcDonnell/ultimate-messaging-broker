@@ -98,6 +98,13 @@ class JobStore:
         d["metadata"] = json.loads(d["metadata"]) if d["metadata"] else None
         return d
 
+    def update_metadata(self, job_id: str, metadata: dict) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE jobs SET metadata=? WHERE id=?",
+                (json.dumps(metadata), job_id),
+            )
+
     def respond(self, job_id: str, action: str) -> None:
         with self._conn() as conn:
             conn.execute(

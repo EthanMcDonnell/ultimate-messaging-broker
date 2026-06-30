@@ -7,9 +7,12 @@ Platform-specific I/O lives in imessage/ and telegram/.
 """
 
 import argparse
+import atexit
 import logging
+import os
 import signal
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -26,6 +29,49 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("main")
+
+
+# ─── Single-instance lock ────────────────────────────────────────────────────
+# Two broker processes on the same platform would both poll Telegram / chat.db
+# and race against each other (especially fatal in tmux mode, where they'd
+# fight over `send-keys` to the same panes). A PID-file lock per platform is
+# enough — same-machine, same-user.
+
+def _is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_singleton_lock(platform: str) -> None:
+    pid_file = Path(tempfile.gettempdir()) / f"claude-messaging-broker-{platform}.pid"
+    if pid_file.exists():
+        try:
+            existing = int(pid_file.read_text().strip())
+        except (ValueError, OSError):
+            existing = None
+        if existing and _is_alive(existing):
+            logger.error(
+                "Another %s broker is already running (PID %d). "
+                "If that's wrong, remove %s and retry.",
+                platform, existing, pid_file,
+            )
+            sys.exit(1)
+        logger.info("Stale pid file at %s — taking over", pid_file)
+    pid_file.write_text(str(os.getpid()))
+
+    def _cleanup() -> None:
+        try:
+            if pid_file.exists() and pid_file.read_text().strip() == str(os.getpid()):
+                pid_file.unlink()
+        except OSError:
+            pass
+
+    atexit.register(_cleanup)
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -202,46 +248,28 @@ def run_imessage(config: dict, state: State, dry_run: bool = False) -> None:
         time.sleep(poll_interval)
 
 
-def process_message_for_project(text: str, config: dict, project: dict, dry_run: bool = False) -> str:
-    """Process a message for a known project, bypassing intent routing."""
-    prompt = sanitize_prompt(text)
-    max_len = config.get("claude", {}).get("max_response_length", 16000)
-    timeout = config.get("claude", {}).get("timeout", 120)
-
-    if dry_run:
-        return f"[DRY RUN] Would ask Claude in {project['path']}:\n{prompt[:200]}"
-
-    response = ask_claude(prompt, project["path"], project.get("allowed_tools", []), timeout)
-
-    if len(response) > max_len:
-        response = response[:max_len] + f"\n\n[Response truncated at {max_len} chars]"
-
-    return response
-
-
 # ─── Telegram platform ────────────────────────────────────────────────────────
 
 def run_telegram(config: dict, state: State, dry_run: bool = False) -> None:
     config = filter_projects_for_platform(config, "telegram")
     from tg.bot import run_telegram_bot
     from jobs import JobStore
+    from sessions import SessionStore
     import api_server
 
     job_store = JobStore()
+    session_store = SessionStore()
 
     api_cfg = config.get("api_server", {})
     host = api_cfg.get("host", "127.0.0.1")
     port = api_cfg.get("port", 8765)
     api_server.start(config, job_store, host=host, port=port)
 
-    def _process_for_project(text: str, project: dict) -> str:
-        return process_message_for_project(text, config, project, dry_run=dry_run)
-
     run_telegram_bot(
         config, state, process_message,
         dry_run=dry_run,
         job_store=job_store,
-        process_for_project_fn=_process_for_project,
+        session_store=session_store,
     )
 
 
@@ -273,6 +301,9 @@ def main():
     args = parser.parse_args()
 
     logging.getLogger().setLevel(args.log_level)
+    for _noisy in ("httpcore", "httpx", "urllib3", "telegram.vendor.ptb_urllib3",
+                   "telegram.ext", "claude_code_sdk"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
     config = load_config(args.config)
 
@@ -281,6 +312,12 @@ def main():
         parser.error("No platform specified. Set 'platform:' in config.yaml or pass --platform imessage|telegram.")
 
     state = State()
+    # Clear saved project if it doesn't belong to the current platform
+    if state.current_project:
+        saved_proj = next((p for p in config.get("projects", []) if p["name"] == state.current_project), None)
+        if saved_proj and platform not in saved_proj.get("platforms", ["imessage", "telegram"]):
+            logger.info("Clearing saved project '%s' (not available on %s)", state.current_project, platform)
+            state.current_project = None
     if not state.current_project:
         default = config.get("default_project")
         topics_configured = any(p.get("telegram_topic_id") for p in config.get("projects", []))
@@ -288,6 +325,8 @@ def main():
             state.set_project(default)
 
     logger.info("Platform: %s", platform)
+
+    _acquire_singleton_lock(platform)
 
     if platform == "imessage":
         run_imessage(config, state, dry_run=args.dry_run)

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-@mc
 ask.py — Send an inline keyboard question to Telegram and return the user's choice.
 
 Usage (CLI):
@@ -34,17 +33,17 @@ Library usage:
     # index is int (0-based) or None (skip/timeout)
 
 Design note:
-    Uses raw bot.get_updates() rather than Application.run_polling() so it
-    coexists with the main bot daemon on the same token. The daemon has no
-    CallbackQueryHandler registered, so callback queries are silently ignored
-    by it and handled exclusively here.
+    Creates a job in jobs.db and sends the question via sendMessage (no getUpdates call).
+    The main bot daemon handles button callbacks and marks the job responded.
+    This avoids the Telegram API conflict that arises when two processes both call
+    getUpdates on the same bot token.
 """
 
 import argparse
 import asyncio
+import json
 import sys
 import time
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -62,39 +61,11 @@ def load_config(config_path: Optional[Path] = None) -> dict:
         return yaml.safe_load(f)
 
 
-def _build_keyboard(options: list[str], callback_prefix: str):
-    """Build InlineKeyboardMarkup with one button per option plus a Skip button."""
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-    rows = []
-    for i, option in enumerate(options):
-        label = str(i + 1)
-        rows.append([InlineKeyboardButton(label, callback_data=f"{callback_prefix}:{i}")])
-    rows.append([InlineKeyboardButton("Skip ↩", callback_data=f"{callback_prefix}:-1")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _build_keyboard_multi(options: list[str], callback_prefix: str, selected: set[int]):
-    """Build InlineKeyboardMarkup with toggle buttons for multi-select."""
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-    rows = []
-    for i, option in enumerate(options):
-        check = "✓ " if i in selected else ""
-        rows.append([InlineKeyboardButton(f"{check}{i + 1}", callback_data=f"{callback_prefix}:{i}")])
-    rows.append([
-        InlineKeyboardButton("✅ Confirm", callback_data=f"{callback_prefix}:confirm"),
-        InlineKeyboardButton("Skip ↩", callback_data=f"{callback_prefix}:-1"),
-    ])
-    return InlineKeyboardMarkup(rows)
-
-
 def _format_message_text(
     question: str,
     options: list[str],
     message_prefix: Optional[str],
 ) -> str:
-    """Compose the full message body."""
     parts = []
     if message_prefix:
         parts.append(message_prefix)
@@ -106,148 +77,32 @@ def _format_message_text(
     return "\n".join(parts)
 
 
-async def _send_question_message(bot, chat_id: int, text: str, keyboard) -> int:
-    """Send the formatted message; return the message_id."""
-    msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
-    return msg.message_id
+def _build_ss_keyboard(job_id: str, options: list[str]):
+    """Single-select keyboard: one numbered button per option, plus Skip."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = [
+        [InlineKeyboardButton(str(i + 1), callback_data=f"job:{job_id}:{i}")]
+        for i in range(len(options))
+    ]
+    rows.append([InlineKeyboardButton("Skip ↩", callback_data=f"job:{job_id}:-1")])
+    return InlineKeyboardMarkup(rows)
 
 
-async def _confirm_selection(
-    bot,
-    chat_id: int,
-    message_id: int,
-    callback_query_id: str,
-    selected_label: str,
-) -> None:
-    """Edit message to show confirmed choice and dismiss the loading indicator."""
-    await bot.answer_callback_query(callback_query_id)
-    await bot.edit_message_text(
-        chat_id=chat_id,
-        message_id=message_id,
-        text=f"✅ Selected: {selected_label}",
-        reply_markup=None,
-    )
-
-
-async def _poll_for_answer(
-    bot,
-    chat_id: int,
-    message_id: int,
-    callback_prefix: str,
-    options: list[str],
-    timeout_seconds: int,
-) -> Optional[int]:
-    """
-    Manual long-poll loop. Returns 0-based option index, or None for skip/timeout.
-    """
-    offset = None
-    deadline = time.monotonic() + timeout_seconds
-
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None  # timeout
-
-        server_timeout = min(30, max(1, int(remaining)))
-
-        try:
-            updates = await bot.get_updates(
-                offset=offset,
-                timeout=server_timeout,
-                read_timeout=server_timeout + 10,
-                allowed_updates=["callback_query"],
-            )
-        except Exception:
-            await asyncio.sleep(2)
-            continue
-
-        for update in updates:
-            offset = update.update_id + 1
-            cq = update.callback_query
-            if cq is None:
-                continue
-            if cq.from_user.id != chat_id:
-                continue
-            if cq.message.message_id != message_id:
-                continue
-            if not cq.data.startswith(callback_prefix + ":"):
-                continue
-
-            index = int(cq.data.split(":", 1)[1])
-            label = options[index] if index >= 0 else "Skip"
-            await _confirm_selection(bot, chat_id, message_id, cq.id, label)
-            return index if index >= 0 else None
-
-
-async def _poll_for_answer_multi(
-    bot,
-    chat_id: int,
-    message_id: int,
-    callback_prefix: str,
-    options: list[str],
-    timeout_seconds: int,
-) -> Optional[list[int]]:
-    """
-    Multi-select poll loop. Toggles selection on each tap; Confirm submits.
-    Returns sorted list of selected indices, or None for skip/timeout.
-    """
-    offset = None
-    deadline = time.monotonic() + timeout_seconds
-    selected: set[int] = set()
-
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None  # timeout
-
-        server_timeout = min(30, max(1, int(remaining)))
-
-        try:
-            updates = await bot.get_updates(
-                offset=offset,
-                timeout=server_timeout,
-                read_timeout=server_timeout + 10,
-                allowed_updates=["callback_query"],
-            )
-        except Exception:
-            await asyncio.sleep(2)
-            continue
-
-        for update in updates:
-            offset = update.update_id + 1
-            cq = update.callback_query
-            if cq is None:
-                continue
-            if cq.from_user.id != chat_id:
-                continue
-            if cq.message.message_id != message_id:
-                continue
-            if not cq.data.startswith(callback_prefix + ":"):
-                continue
-
-            payload = cq.data.split(":", 1)[1]
-
-            if payload == "-1":  # Skip
-                await _confirm_selection(bot, chat_id, message_id, cq.id, "Skip")
-                return None
-
-            if payload == "confirm":
-                labels = ", ".join(options[i] for i in sorted(selected)) or "none"
-                await _confirm_selection(bot, chat_id, message_id, cq.id, labels)
-                return sorted(selected)
-
-            # Toggle selection
-            index = int(payload)
-            if index in selected:
-                selected.discard(index)
-            else:
-                selected.add(index)
-
-            await bot.answer_callback_query(cq.id)
-            keyboard = _build_keyboard_multi(options, callback_prefix, selected)
-            await bot.edit_message_reply_markup(
-                chat_id=chat_id, message_id=message_id, reply_markup=keyboard
-            )
+def _build_ms_keyboard(job_id: str, options: list[str], selected: set):
+    """Multi-select keyboard: toggle buttons, Confirm, Skip."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = [
+        [InlineKeyboardButton(
+            ("✓ " if i in selected else "") + str(i + 1),
+            callback_data=f"job:{job_id}:t{i}",
+        )]
+        for i in range(len(options))
+    ]
+    rows.append([
+        InlineKeyboardButton("✅ Confirm", callback_data=f"job:{job_id}:confirm"),
+        InlineKeyboardButton("Skip ↩", callback_data=f"job:{job_id}:-1"),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 async def ask_user(
@@ -262,28 +117,45 @@ async def ask_user(
     """
     Send an inline keyboard question and block until the user responds.
 
+    Requires the main bot daemon to be running — it handles button callbacks and
+    marks the job responded in jobs.db.  This function never calls getUpdates.
+
     Single-select (default): returns 0-based index, or None for skip/timeout.
     Multi-select: returns sorted list of selected indices, or None for skip/timeout.
     """
     from telegram import Bot
 
-    callback_prefix = str(uuid.uuid4())[:8]
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from jobs import JobStore
+
+    job_store = JobStore()
     text = _format_message_text(question, options, message_prefix)
 
     if multi_select:
-        keyboard = _build_keyboard_multi(options, callback_prefix, set())
-        async with Bot(token=bot_token) as bot:
-            message_id = await _send_question_message(bot, chat_id, text, keyboard)
-            return await _poll_for_answer_multi(
-                bot, chat_id, message_id, callback_prefix, options, timeout_seconds
-            )
+        metadata = {"type": "multi_select", "options": options, "selected": []}
+        job_id = job_store.create(text, buttons=None, on_response=None, metadata=metadata)
+        keyboard = _build_ms_keyboard(job_id, options, set())
     else:
-        keyboard = _build_keyboard(options, callback_prefix)
-        async with Bot(token=bot_token) as bot:
-            message_id = await _send_question_message(bot, chat_id, text, keyboard)
-            return await _poll_for_answer(
-                bot, chat_id, message_id, callback_prefix, options, timeout_seconds
-            )
+        job_id = job_store.create(text, buttons=None, on_response=None)
+        keyboard = _build_ss_keyboard(job_id, options)
+
+    async with Bot(token=bot_token) as bot:
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        job = job_store.get(job_id)
+        if job and job["status"] == "responded":
+            action = job["action"]
+            if action in ("-1", "skip"):
+                return None
+            if multi_select:
+                return json.loads(action)
+            idx = int(action)
+            return idx if idx >= 0 else None
+        await asyncio.sleep(0.5)
+
+    return None
 
 
 def main() -> None:

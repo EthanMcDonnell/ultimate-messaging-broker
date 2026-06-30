@@ -30,6 +30,12 @@ telegram:
   # To find: open the group in Telegram Web — the URL is /c/<group_id>/<topic_id>/<msg_id>
   # Prefix the group_id with -100 for the Bot API, e.g. /c/1234567890 → -1001234567890
   # telegram_group_id: -1001234567890
+  #
+  # Telegram topics drive interactive `claude` via tmux — this keeps using the
+  # regular plan rather than the separate Agent-SDK credit pool that takes over
+  # on 2026-06-15. Requires `tmux` on PATH. Inspect live sessions with
+  # `tmux ls | grep claudebroker-`. Stale sessions are reaped on /new and the
+  # 24h TTL.
 
 # ─── API Server (Telegram platform only) ──────────────────────────────────────
 # HTTP server that lets other projects post jobs to Telegram and receive responses.

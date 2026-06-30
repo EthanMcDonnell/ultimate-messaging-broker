@@ -1,7 +1,7 @@
 """
 Lightweight HTTP API server for posting jobs to Telegram from external projects.
 
-POST /send
+POST /telegram/send
   Body: {
     "content": "text to send",
     "topic_id": 123,                        // optional; Telegram topic thread ID
@@ -17,8 +17,21 @@ POST /send
   }
   Returns: {"job_id": "abc12345"}
 
-GET /jobs/<id>
+GET /telegram/jobs/<id>
   Returns the full job record including status ("pending" | "responded") and action.
+
+POST /claude/ask
+  Body: {
+    "prompt": "explain this codebase",
+    "directory": "/abs/path/to/project",
+    "allowed_tools": ["Read", "Edit", "Bash"],  // optional; defaults to read-only tools
+    "timeout": 300,                              // optional; seconds (default 600)
+    "session_id": "8f3c…",                       // optional; resume a specific session
+    "new_session": false                         // optional; true = force fresh session
+  }
+  Returns: {"response": "...", "session_id": "<uuid>"}
+  Backed by `claude -p`. Pass a session_id (the UUID returned by a prior call)
+  to continue that conversation; omit it, or set new_session, to start fresh.
 """
 
 import json
@@ -26,7 +39,10 @@ import logging
 import threading
 import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from claude_bridge import ask_claude_json
 
 logger = logging.getLogger(__name__)
 
@@ -55,15 +71,7 @@ def _send_telegram_message(
     return result["result"]["message_id"]
 
 
-def _build_inline_keyboard(job_id: str, buttons: list) -> dict:
-    rows = []
-    for btn in buttons:
-        if isinstance(btn, str):
-            label, action = btn, btn.lower()
-        else:
-            label, action = btn["label"], btn["action"]
-        rows.append([{"text": label, "callback_data": f"job:{job_id}:{action}"}])
-    return {"inline_keyboard": rows}
+from tg.utils import build_inline_keyboard as _build_inline_keyboard
 
 
 def _resolve_topic_id(name: str, projects: list[dict]) -> int | None:
@@ -98,24 +106,57 @@ def _make_handler(config: dict, job_store):
             return json.loads(self.rfile.read(length)) if length else {}
 
         def do_GET(self):
-            if self.path.startswith("/jobs/"):
-                job_id = self.path[len("/jobs/"):]
+            if self.path.startswith("/telegram/jobs/"):
+                job_id = self.path[len("/telegram/jobs/"):]
                 job = job_store.get(job_id)
                 self._json(200 if job else 404, job or {"error": "not found"})
+            elif self.path == "/claude/sessions":
+                # `claude -p` sessions live in claude's own ~/.claude store with
+                # no broker-side registry to enumerate. Kept for compatibility.
+                self._json(200, {"sessions": [], "note": "session listing unavailable with the claude -p backend"})
             else:
                 self._json(404, {"error": "not found"})
 
         def do_POST(self):
-            if self.path != "/send":
-                self._json(404, {"error": "not found"})
-                return
-
             try:
                 body = self._read_body()
             except Exception:
                 self._json(400, {"error": "invalid JSON"})
                 return
 
+            if self.path == "/claude/ask":
+                self._handle_ask(body)
+            elif self.path == "/telegram/send":
+                self._handle_send(body, bot_token, dm_chat_id, group_chat_id, projects, job_store)
+            else:
+                self._json(404, {"error": "not found"})
+
+        def _handle_ask(self, body: dict) -> None:
+            prompt = (body.get("prompt") or "").strip()
+            directory = body.get("directory")
+            if not prompt or not directory:
+                self._json(400, {"error": "prompt and directory are required"})
+                return
+            timeout = int(body.get("timeout", 600))
+            allowed_tools = body.get("allowed_tools") or []
+
+            # Resume the supplied session, or pin a fresh UUID for a new one.
+            session_id = body.get("session_id")
+            new_session = bool(body.get("new_session"))
+            resume = bool(session_id) and not new_session
+            if not session_id or new_session:
+                session_id = str(uuid.uuid4())
+
+            result = ask_claude_json(
+                prompt, directory, allowed_tools, timeout=timeout,
+                session_id=session_id, resume=resume,
+            )
+            self._json(200 if result.get("ok") else 500, {
+                "response": result.get("response", ""),
+                "session_id": result.get("session_id", session_id),
+            })
+
+        def _handle_send(self, body: dict, bot_token, dm_chat_id, group_chat_id, projects, job_store) -> None:
             content = body.get("content", "").strip()
             if not content:
                 self._json(400, {"error": "content is required"})

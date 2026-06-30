@@ -8,16 +8,17 @@ A single `main.py` entry point handles both platforms. When a message arrives it
 
 1. **Intent detection** — is this "list projects", "switch to X", or a question for Claude?
 2. **Project resolution** — each project maps to a directory on disk with its own allowed tools
-3. **Claude invocation** — runs `claude -p` in the project directory via subprocess
+3. **Claude invocation** — Telegram topics use the Agent SDK (streaming, session persistence, tool permission hooks); iMessage and Telegram DMs use the CLI subprocess
 4. **Reply** — sends the response back through the platform's transport layer
 
 ```
 main.py                  ← entry point + shared process_message()
-├── claude_bridge.py     ← runs Claude CLI
+├── claude_bridge.py     ← CLI subprocess (iMessage) + Agent SDK async (Telegram topics)
 ├── router.py            ← intent detection (switch / list / ask)
 ├── security.py          ← rate limiting, input sanitization
 ├── state.py             ← persists current project across restarts
-├── jobs.py              ← SQLite store for async API jobs
+├── sessions.py          ← persists Claude session IDs per Telegram topic (24h TTL)
+├── jobs.py              ← SQLite store for async API jobs and permission prompts
 ├── dispatcher.py        ← routes job responses (webhook / script / claude)
 ├── api_server.py        ← HTTP API server (Telegram platform only)
 │
@@ -26,8 +27,10 @@ main.py                  ← entry point + shared process_message()
 │   ├── responder.py     ← sends replies via AppleScript
 │   └── message_parser.py ← parses iMessage attributedBody blobs
 │
-└── telegram/
-    └── bot.py           ← Telegram bot, topic routing, job callbacks
+└── tg/
+    ├── bot.py           ← Telegram bot, topic routing, job callbacks, SDK integration
+    ├── ask.py           ← standalone blocking inline-keyboard question utility
+    └── utils.py         ← shared Telegram helpers (inline keyboard builder)
 ```
 
 ---
@@ -110,7 +113,7 @@ One of the two must be set — the process will exit with an error if neither is
 ### iMessage
 
 ```bash
-python main.py --platform imessage
+.venv/bin/python main.py --platform imessage
 ```
 
 Send a message **to yourself** in iMessage. The bridge monitors your self-chat.
@@ -118,7 +121,7 @@ Send a message **to yourself** in iMessage. The bridge monitors your self-chat.
 ### Telegram
 
 ```bash
-python main.py --platform telegram
+.venv/bin/python main.py --platform telegram
 ```
 
 Open your bot in Telegram and start sending messages.
@@ -146,6 +149,26 @@ These work on both platforms and are matched with fuzzy intent detection (design
 | Anything else | Sent to Claude in the current project |
 
 Project names are fuzzy-matched, so Siri-dictated phrases like "hey switch to the bridge project" will resolve correctly.
+
+---
+
+## Telegram bot commands
+
+| Command | What it does |
+|---|---|
+| `/start` | Check the bot is connected; shows current project |
+| `/status` | Shows platform, projects, and whether the Claude CLI is found |
+| `/new` | Start a fresh Claude session in the current topic (clears conversation history) |
+| `/stop` `/cancel` `/esc` | Stop the currently running Claude call in this topic |
+| `/killall` `/stopall` | Cancel all running Claude calls across all topics |
+
+### Sessions
+
+When you message a configured topic, Claude remembers the conversation context for 24 hours. Each topic has its own independent session. Use `/new` to reset a topic to a blank slate.
+
+### Tool permission prompts
+
+When Claude wants to use a tool (read a file, run a command, etc.), the bot sends an inline keyboard with **Allow** and **Deny** buttons. The call is blocked until you respond. If you don't respond within 60 seconds, the tool use is automatically denied and Claude is told why.
 
 ---
 
@@ -345,7 +368,7 @@ Replies are prefixed with `✦claude✦` so the bridge can recognise and skip it
 ## Tests
 
 ```bash
-python -m pytest imessage/tests/
+.venv/bin/python -m pytest imessage/tests/
 ```
 
 Tests cover intent routing, input sanitization, and message parsing. They import from the shared root modules automatically.
