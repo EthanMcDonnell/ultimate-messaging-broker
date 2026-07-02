@@ -84,9 +84,21 @@ def load_config(config_path: Path) -> dict:
 
 
 def _validate_config(config: dict) -> None:
-    """Fail fast on startup if project paths are missing or unsafe."""
+    """Fail fast on startup if project paths are missing or unsafe.
+
+    `path` is only used when Claude runs, so it is required *iff*
+    `claude_enabled` is true. Notification-only topics (claude_enabled: false)
+    may omit it entirely.
+    """
     for project in config.get("projects", []):
-        path = Path(project.get("path", "")).resolve()
+        if not project.get("claude_enabled", True):
+            continue
+        raw_path = project.get("path")
+        if not raw_path:
+            raise ValueError(
+                f"Project '{project['name']}' has claude_enabled but no 'path'."
+            )
+        path = Path(raw_path).resolve()
         if not path.is_dir():
             raise ValueError(f"Project '{project['name']}' path does not exist: {path}")
         home = Path.home().resolve()
